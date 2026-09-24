@@ -22,6 +22,7 @@ type Memory struct {
 	versions   map[string][]*domain.Version // key: tenant/itemID/env
 	versionSeq map[string]int64             // key: tenant/itemID/env
 	releases   map[string]*domain.Release
+	refs       map[string][]*domain.RawRef // key: tenant/itemID/env
 	verDBSeq   int64
 }
 
@@ -36,6 +37,7 @@ func NewMemory() *Memory {
 		versions:   map[string][]*domain.Version{},
 		versionSeq: map[string]int64{},
 		releases:   map[string]*domain.Release{},
+		refs:       map[string][]*domain.RawRef{},
 	}
 }
 
@@ -254,6 +256,19 @@ func (m *Memory) CountItems(_ context.Context, tenantID, namespaceID, groupID st
 	return c, nil
 }
 
+func (m *Memory) ListAllItems(_ context.Context, tenantID string) ([]*domain.Item, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var out []*domain.Item
+	for _, item := range m.items {
+		if item.TenantID == tenantID {
+			out = append(out, cloneItem(item))
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
 func (m *Memory) UpdateItemSchema(_ context.Context, tenantID, id, schema string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -307,6 +322,8 @@ func (m *Memory) CommitValue(_ context.Context, p CommitValueParams) (*domain.Ve
 		Value: p.Value, Version: newVer, UpdatedAt: v.CreatedAt, UpdatedBy: p.Operator,
 	}
 	item.UpdatedAt = v.CreatedAt
+	// The new value re-declares its complete outgoing reference edge set.
+	m.replaceRefsLocked(p.TenantID, p.ItemID, p.Env, p.Refs)
 	cp := *v
 	return &cp, nil
 }
@@ -409,7 +426,80 @@ func (m *Memory) ActiveReleases(_ context.Context, tenantID, namespaceID string)
 	return out, nil
 }
 
+func (m *Memory) ActiveReleasesAll(_ context.Context, tenantID string) ([]*domain.Release, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var out []*domain.Release
+	for _, r := range m.releases {
+		if r.TenantID == tenantID && r.Status == domain.ReleaseGray {
+			cp := *r
+			out = append(out, &cp)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].StartedAt.Before(out[j].StartedAt) })
+	return out, nil
+}
+
 func (m *Memory) Close() error { return nil }
+
+func (m *Memory) replaceRefsLocked(tenantID, itemID, env string, refs []*domain.RawRef) {
+	key := tenantID + "/" + itemID + "/" + env
+	if len(refs) == 0 {
+		delete(m.refs, key)
+		return
+	}
+	cp := make([]*domain.RawRef, len(refs))
+	for i, r := range refs {
+		x := *r
+		cp[i] = &x
+	}
+	m.refs[key] = cp
+}
+
+// ReplaceItemRefs overwrites the outgoing edges of one item+env.
+func (m *Memory) ReplaceItemRefs(_ context.Context, tenantID, itemID, env string, refs []*domain.RawRef) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if item, ok := m.items[itemID]; !ok || item.TenantID != tenantID {
+		return ErrNotFound
+	}
+	m.replaceRefsLocked(tenantID, itemID, env, refs)
+	return nil
+}
+
+func (m *Memory) ListItemRefs(_ context.Context, tenantID, itemID, env string) ([]*domain.RawRef, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	list := m.refs[tenantID+"/"+itemID+"/"+env]
+	out := make([]*domain.RawRef, 0, len(list))
+	for _, r := range list {
+		cp := *r
+		out = append(out, &cp)
+	}
+	return out, nil
+}
+
+func (m *Memory) ListAllItemRefs(_ context.Context, tenantID string) ([]*domain.RawRef, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var out []*domain.RawRef
+	for _, list := range m.refs {
+		for _, r := range list {
+			if r.TenantID != tenantID {
+				continue
+			}
+			cp := *r
+			out = append(out, &cp)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].ItemID != out[j].ItemID {
+			return out[i].ItemID < out[j].ItemID
+		}
+		return out[i].TargetKey < out[j].TargetKey
+	})
+	return out, nil
+}
 
 func cloneItem(in *domain.Item) *domain.Item {
 	cp := *in

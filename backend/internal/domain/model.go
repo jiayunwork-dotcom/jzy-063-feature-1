@@ -218,6 +218,29 @@ type EffectiveItem struct {
 	SourceVer int64  `json:"source_version"`
 }
 
+// RawRef is one placeholder edge stored per committed version of an item in
+// an environment. It describes the placeholder as written; the concrete
+// target item is resolved by the service against the current context.
+type RawRef struct {
+	ItemID     string `json:"item_id"`
+	TenantID   string `json:"tenant_id"`
+	Env        string `json:"env"`
+	TargetKey  string `json:"target_key"`
+	TargetBare bool   `json:"target_bare"`
+}
+
+// RefTargetView is one resolved target shown on the console reference tab.
+type RefTargetView struct {
+	Key         string `json:"key"`
+	Bare        bool   `json:"bare"`
+	Env         string `json:"env"`
+	ItemID      string `json:"item_id,omitempty"`
+	NamespaceID string `json:"namespace_id,omitempty"`
+	GroupID     string `json:"group_id,omitempty"`
+	Layer       Layer  `json:"layer,omitempty"`
+	Resolved    bool   `json:"resolved"` // false: no such item exists in the tenant
+}
+
 // NamespaceStats feeds the connection / recent-push dashboard.
 type NamespaceStats struct {
 	NamespaceID string     `json:"namespace_id"`

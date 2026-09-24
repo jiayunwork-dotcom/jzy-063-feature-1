@@ -417,6 +417,21 @@ func (p *Postgres) CommitValue(ctx context.Context, in CommitValueParams) (*doma
 			in.ItemID, in.Env, in.Retention)
 	}
 
+	// Re-declare the full outgoing reference edge set of this item+env.
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM item_refs WHERE tenant_id=$1 AND item_id=$2 AND env=$3`,
+		in.TenantID, in.ItemID, in.Env); err != nil {
+		return nil, err
+	}
+	for _, r := range in.Refs {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO item_refs (tenant_id, item_id, env, target_key, target_bare)
+			 VALUES ($1,$2,$3,$4,$5)`,
+			in.TenantID, in.ItemID, in.Env, r.TargetKey, r.TargetBare); err != nil {
+			return nil, err
+		}
+	}
+
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
@@ -571,6 +586,109 @@ func (p *Postgres) ActiveReleases(ctx context.Context, tenantID, namespaceID str
 		"SELECT "+releaseColumns+
 			" FROM releases WHERE tenant_id=$1 AND namespace_id=$2 AND status='gray' ORDER BY started_at",
 		tenantID, namespaceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*domain.Release
+	for rows.Next() {
+		r, err := scanRelease(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ReplaceItemRefs overwrites the outgoing edges of one item+env.
+func (p *Postgres) ReplaceItemRefs(ctx context.Context, tenantID, itemID, env string, refs []*domain.RawRef) error {
+	tx, err := p.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM item_refs WHERE tenant_id=$1 AND item_id=$2 AND env=$3`,
+		tenantID, itemID, env); err != nil {
+		return err
+	}
+	for _, r := range refs {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO item_refs (tenant_id, item_id, env, target_key, target_bare)
+			 VALUES ($1,$2,$3,$4,$5)`,
+			tenantID, itemID, env, r.TargetKey, r.TargetBare); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+const rawRefColumns = `tenant_id, item_id, env, target_key, target_bare`
+
+func scanRawRefs(rows *sql.Rows) ([]*domain.RawRef, error) {
+	var out []*domain.RawRef
+	for rows.Next() {
+		r := &domain.RawRef{}
+		if err := rows.Scan(&r.TenantID, &r.ItemID, &r.Env, &r.TargetKey, &r.TargetBare); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+func (p *Postgres) ListItemRefs(ctx context.Context, tenantID, itemID, env string) ([]*domain.RawRef, error) {
+	rows, err := p.db.QueryContext(ctx,
+		"SELECT "+rawRefColumns+" FROM item_refs WHERE tenant_id=$1 AND item_id=$2 AND env=$3 ORDER BY id",
+		tenantID, itemID, env)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanRawRefs(rows)
+}
+
+func (p *Postgres) ListAllItemRefs(ctx context.Context, tenantID string) ([]*domain.RawRef, error) {
+	rows, err := p.db.QueryContext(ctx,
+		"SELECT "+rawRefColumns+" FROM item_refs WHERE tenant_id=$1 ORDER BY item_id, id", tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanRawRefs(rows)
+}
+
+func (p *Postgres) ListAllItems(ctx context.Context, tenantID string) ([]*domain.Item, error) {
+	rows, err := p.db.QueryContext(ctx,
+		"SELECT "+itemColumns+" FROM items WHERE tenant_id=$1 ORDER BY id", tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*domain.Item
+	for rows.Next() {
+		item, err := scanItem(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for _, item := range out {
+		if err := p.fillValues(ctx, item); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+func (p *Postgres) ActiveReleasesAll(ctx context.Context, tenantID string) ([]*domain.Release, error) {
+	rows, err := p.db.QueryContext(ctx,
+		"SELECT "+releaseColumns+" FROM releases WHERE tenant_id=$1 AND status='gray' ORDER BY started_at",
+		tenantID)
 	if err != nil {
 		return nil, err
 	}

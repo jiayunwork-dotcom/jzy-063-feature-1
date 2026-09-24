@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -140,22 +141,30 @@ func openPostgresWithRetry(dsn string, attempts int) (*store.Postgres, error) {
 }
 
 func applySchema(pg *store.Postgres, dir string) error {
-	paths := []string{
-		filepath.Join(dir, "001_init.sql"),
-		"/deploy/db/001_init.sql",
-	}
-	for _, p := range paths {
-		b, err := os.ReadFile(p)
-		if err != nil {
-			continue
+	files := []string{"001_init.sql", "002_refs.sql"}
+	for _, f := range files {
+		paths := []string{
+			filepath.Join(dir, f),
+			filepath.Join("/deploy/db", f),
 		}
-		if _, err := pg.DB().Exec(string(b)); err != nil {
-			return err
+		var applied bool
+		for _, p := range paths {
+			b, err := os.ReadFile(p)
+			if err != nil {
+				continue
+			}
+			if _, err := pg.DB().Exec(string(b)); err != nil {
+				return err
+			}
+			log.Printf("schema applied from %s", p)
+			applied = true
+			break
 		}
-		log.Printf("schema applied from %s", p)
-		return nil
+		if !applied {
+			return fmt.Errorf("schema file %s not found", f)
+		}
 	}
-	return os.ErrNotExist
+	return nil
 }
 
 // seed creates a demo tenant plus one namespace/group with a sample layered

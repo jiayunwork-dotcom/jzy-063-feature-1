@@ -204,6 +204,13 @@ func cloneMap(in map[string]any) map[string]any {
 }
 
 func decode(f domain.Format, raw string) (map[string]any, error) {
+	return Decode(f, raw)
+}
+
+// Decode parses a configuration document into the generic tree shared by the
+// merge and reference kernels. Exported so the reference layer can scan and
+// substitute placeholders using exactly the same parsing rules.
+func Decode(f domain.Format, raw string) (map[string]any, error) {
 	switch f {
 	case domain.FormatJSON:
 		var m map[string]any
@@ -252,6 +259,13 @@ func decodeProperties(raw string) map[string]any {
 }
 
 func encode(f domain.Format, root map[string]any) (string, error) {
+	return Encode(f, root)
+}
+
+// Encode serializes a generic tree back into the given format. Exported so
+// the reference kernel can re-render a placeholder-substituted tree and keep
+// the result a legal JSON/YAML/Properties/TOML document.
+func Encode(f domain.Format, root map[string]any) (string, error) {
 	switch f {
 	case domain.FormatJSON:
 		b, err := json.MarshalIndent(root, "", "  ")
@@ -296,6 +310,13 @@ func encodeProperties(root map[string]any) string {
 }
 
 func formatScalar(v any) string {
+	return FormatScalar(v)
+}
+
+// FormatScalar renders one decoded scalar the same way the encoders do. It is
+// used by the reference kernel when an embedded placeholder pulls a numeric
+// or boolean leaf out of another document.
+func FormatScalar(v any) string {
 	switch x := v.(type) {
 	case nil:
 		return ""

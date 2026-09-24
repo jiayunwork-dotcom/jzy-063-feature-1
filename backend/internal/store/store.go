@@ -24,12 +24,14 @@ var ErrQuota = errors.New("store: quota exceeded")
 var ErrDuplicate = errors.New("store: duplicate key")
 
 // CommitValueParams atomically advances one item's environment value and
-// appends a historical version.
+// appends a historical version. Refs replaces the raw reference edges of the
+// item+env, so every commit re-declares the full outgoing set.
 type CommitValueParams struct {
 	TenantID        string
 	ItemID          string
 	Env             string
 	Value           string
+	Refs            []*domain.RawRef
 	Operator        string
 	ChangeType      string
 	Note            string
@@ -59,6 +61,9 @@ type Store interface {
 	GetItem(ctx context.Context, tenantID, id string) (*domain.Item, error)
 	GetItemByKey(ctx context.Context, tenantID, namespaceID, groupID, key string) (*domain.Item, error)
 	ListItems(ctx context.Context, tenantID, namespaceID, groupID string) ([]*domain.Item, error)
+	// ListAllItems returns every item of a tenant, used to project the
+	// tenant-wide reference dependency graph.
+	ListAllItems(ctx context.Context, tenantID string) ([]*domain.Item, error)
 	CountItems(ctx context.Context, tenantID, namespaceID, groupID string) (int, error)
 	UpdateItemSchema(ctx context.Context, tenantID, id, schema string) error
 	CommitValue(ctx context.Context, p CommitValueParams) (*domain.Version, error)
@@ -74,6 +79,18 @@ type Store interface {
 	// namespace. It backs the serving-time gate so non-selected instances
 	// keep receiving the previous value.
 	ActiveReleases(ctx context.Context, tenantID, namespaceID string) ([]*domain.Release, error)
+	// ActiveReleasesAll returns every gray release of a tenant across all
+	// namespaces, so cross-namespace references inherit gray visibility.
+	ActiveReleasesAll(ctx context.Context, tenantID string) ([]*domain.Release, error)
+
+	// ReplaceItemRefs atomically sets the outgoing reference edges of one
+	// item+env (an empty slice removes them all).
+	ReplaceItemRefs(ctx context.Context, tenantID, itemID, env string, refs []*domain.RawRef) error
+	// ListItemRefs returns the outgoing edges of one item+env.
+	ListItemRefs(ctx context.Context, tenantID, itemID, env string) ([]*domain.RawRef, error)
+	// ListAllItemRefs returns every raw edge of a tenant, used to project the
+	// concrete dependency graph.
+	ListAllItemRefs(ctx context.Context, tenantID string) ([]*domain.RawRef, error)
 
 	Close() error
 }

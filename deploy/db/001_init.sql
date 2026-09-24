@@ -94,3 +94,20 @@ CREATE TABLE IF NOT EXISTS releases (
 );
 
 CREATE INDEX IF NOT EXISTS idx_releases_ns ON releases(tenant_id, namespace_id, started_at DESC);
+
+-- Raw reference edges: one row per placeholder declared by one item+env.
+-- Replaced wholesale on every commit, so the graph always matches the latest
+-- value. The concrete target is projected at read time against the current
+-- namespace/group/key locations.
+CREATE TABLE IF NOT EXISTS item_refs (
+    id          BIGINT PRIMARY KEY DEFAULT nextval('versions_id_seq'),
+    tenant_id   TEXT NOT NULL,
+    item_id     TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    env         TEXT NOT NULL,
+    target_key  TEXT NOT NULL,
+    target_bare BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_item_refs_src ON item_refs(tenant_id, item_id, env);
+CREATE INDEX IF NOT EXISTS idx_item_refs_tenant ON item_refs(tenant_id);
