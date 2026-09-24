@@ -198,5 +198,12 @@ func seed(ctx context.Context, svc *service.Service) {
 		domain.FormatJSON, "{\n  \"timeout\": 2000,\n  \"log\": {\"format\": \"json\"}\n}\n")
 	mustItem("payment", "gateway", "app",
 		domain.FormatJSON, "{\n  \"name\": \"payment-gateway\"\n}\n")
+
+	// Reference demo: a shared host name in the public layer is embedded into
+	// the group's database connection string at effective time.
+	mustItem(domain.PublicNamespaceID, domain.PublicNamespaceID, "db_host",
+		domain.FormatProperties, "host=shared-postgres.internal\n")
+	mustItem("payment", "gateway", "db_conn",
+		domain.FormatProperties, "url=jdbc:postgresql://@{db_host}:5432/pay\npool=16\n")
 	log.Println("seed data ready (tenant=demo)")
 }

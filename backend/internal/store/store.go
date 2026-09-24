@@ -24,12 +24,14 @@ var ErrQuota = errors.New("store: quota exceeded")
 var ErrDuplicate = errors.New("store: duplicate key")
 
 // CommitValueParams atomically advances one item's environment value and
-// appends a historical version.
+// appends a historical version. Revision is the tenant-wide clock reading
+// preallocated by the service (see NextTenantRevision).
 type CommitValueParams struct {
 	TenantID        string
 	ItemID          string
 	Env             string
 	Value           string
+	Revision        int64
 	Operator        string
 	ChangeType      string
 	Note            string
@@ -74,6 +76,21 @@ type Store interface {
 	// namespace. It backs the serving-time gate so non-selected instances
 	// keep receiving the previous value.
 	ActiveReleases(ctx context.Context, tenantID, namespaceID string) ([]*domain.Release, error)
+
+	// NextTenantRevision atomically advances and returns the tenant-wide
+	// monotonic clock. Effective snapshots version themselves by the max
+	// revision over a key and its whole reference closure, so changing a
+	// referenced key moves every dependent key's served revision.
+	NextTenantRevision(ctx context.Context, tenantID string) (int64, error)
+
+	// ---- reference graph ----
+
+	// SetItemRefs replaces all placeholder edges of one item+env.
+	SetItemRefs(ctx context.Context, tenantID, itemID, env string, edges []domain.RefEdge) error
+	// ItemRefs reads the persisted edges of one item+env.
+	ItemRefs(ctx context.Context, tenantID, itemID, env string) ([]domain.RefEdge, error)
+	// AllItemRefs returns every edge of one tenant (env empty means all envs).
+	AllItemRefs(ctx context.Context, tenantID, env string) ([]domain.RefEdge, error)
 
 	Close() error
 }

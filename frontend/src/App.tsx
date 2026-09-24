@@ -13,6 +13,7 @@ import { VersionTimeline } from './components/VersionTimeline'
 import { GrayPanel } from './components/GrayPanel'
 import { Dashboard } from './components/Dashboard'
 import { EffectiveView } from './components/EffectiveView'
+import { ReferencePanel } from './components/ReferencePanel'
 import { FORMATS } from './components/layerLabels'
 
 const ENVS = ['dev', 'staging', 'prod']
@@ -26,7 +27,7 @@ export default function App() {
   const [itemsByGroup, setItemsByGroup] = useState<Record<string, Item[]>>({})
   const [selection, setSelection] = useState<Selection | null>(null)
   const [env, setEnv] = useState('dev')
-  const [tab, setTab] = useState<'edit' | 'effective' | 'gray' | 'dashboard'>('edit')
+  const [tab, setTab] = useState<'edit' | 'effective' | 'gray' | 'refs' | 'dashboard'>('edit')
   const [live, setLive] = useState(false)
   const [tick, setTick] = useState(0)
   const [toast, setToast] = useState('')
@@ -233,6 +234,11 @@ export default function App() {
                     灰度面板
                   </div>
                 )}
+                {selection.itemId && (
+                  <div className={`tab ${tab === 'refs' ? 'active' : ''}`} onClick={() => setTab('refs')}>
+                    引用关系
+                  </div>
+                )}
                 {selection.group !== '_defaults' && (
                   <div
                     className={`tab ${tab === 'effective' ? 'active' : ''}`}
@@ -311,6 +317,10 @@ export default function App() {
                     setTick((n) => n + 1)
                   }}
                 />
+              )}
+
+              {tab === 'refs' && selectedItem && (
+                <ReferencePanel item={selectedItem} env={env} reloadToken={tick} />
               )}
 
               {tab === 'effective' && (

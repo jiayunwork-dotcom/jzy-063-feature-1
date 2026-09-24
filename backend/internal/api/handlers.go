@@ -250,6 +250,31 @@ func (s *Server) diff(c *gin.Context) {
 	c.JSON(200, gin.H{"from": a, "to": b, "lines": rows})
 }
 
+// ---------- reference graph ----------
+
+func (s *Server) itemRefs(c *gin.Context) {
+	out, err := s.svc.ItemGraph(c.Request.Context(), tenantID(c), c.Param("id"), c.Query("env"))
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	c.JSON(200, gin.H{"references": out})
+}
+
+func (s *Server) itemImpact(c *gin.Context) {
+	env := c.Query("env")
+	if env == "" {
+		c.JSON(400, gin.H{"error": "env query param is required"})
+		return
+	}
+	out, err := s.svc.Impact(c.Request.Context(), tenantID(c), c.Param("id"), env)
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	c.JSON(200, out)
+}
+
 // ---------- gray releases ----------
 
 func (s *Server) listReleases(c *gin.Context) {

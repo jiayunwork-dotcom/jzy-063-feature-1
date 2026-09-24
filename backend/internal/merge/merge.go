@@ -24,6 +24,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"configcenter/internal/domain"
+	refmask "configcenter/internal/ref"
 )
 
 // LayerInput is one layer's contribution to a configuration key.
@@ -204,22 +205,37 @@ func cloneMap(in map[string]any) map[string]any {
 }
 
 func decode(f domain.Format, raw string) (map[string]any, error) {
+	return Decode(f, raw)
+}
+
+// Decode parses a document of the given format into a generic object. It is
+// exported so the reference resolver can substitute placeholders and re-check
+// structural validity using the exact same parser as the merge kernel.
+//
+// Structural placeholders (a "@{...}" token in an unquoted scalar position,
+// which would not parse before dereference) are masked into sentinel strings
+// first; the resolver turns them back into real values after merging.
+func Decode(f domain.Format, raw string) (map[string]any, error) {
+	masked, err := refmask.Mask(raw, refmask.MaskKindFor(string(f)))
+	if err != nil {
+		return nil, err
+	}
 	switch f {
 	case domain.FormatJSON:
 		var m map[string]any
-		if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		if err := json.Unmarshal([]byte(masked), &m); err != nil {
 			return nil, err
 		}
 		return m, nil
 	case domain.FormatYAML:
 		var m map[string]any
-		if err := yaml.Unmarshal([]byte(raw), &m); err != nil {
+		if err := yaml.Unmarshal([]byte(masked), &m); err != nil {
 			return nil, err
 		}
 		return m, nil
 	case domain.FormatTOML:
 		var m map[string]any
-		if _, err := toml.Decode(raw, &m); err != nil {
+		if _, err := toml.Decode(masked, &m); err != nil {
 			return nil, err
 		}
 		return m, nil
@@ -252,6 +268,12 @@ func decodeProperties(raw string) map[string]any {
 }
 
 func encode(f domain.Format, root map[string]any) (string, error) {
+	return Encode(f, root)
+}
+
+// Encode serializes a generic object in the requested format. It is exported
+// for the reference resolver, which renders documents after substitution.
+func Encode(f domain.Format, root map[string]any) (string, error) {
 	switch f {
 	case domain.FormatJSON:
 		b, err := json.MarshalIndent(root, "", "  ")
@@ -296,6 +318,12 @@ func encodeProperties(root map[string]any) string {
 }
 
 func formatScalar(v any) string {
+	return FormatScalar(v)
+}
+
+// FormatScalar renders one scalar value in the canonical text used by the
+// properties encoder. Exported for embedded placeholder substitution.
+func FormatScalar(v any) string {
 	switch x := v.(type) {
 	case nil:
 		return ""

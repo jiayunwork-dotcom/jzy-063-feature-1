@@ -92,6 +92,29 @@ export interface FieldSource {
   source_version: number
 }
 
+export interface RefHop {
+  namespace_id: string
+  group_id: string
+  key: string
+  env: string
+}
+
+export interface RefSegment {
+  placeholder: string
+  namespace_id: string
+  group_id: string
+  key: string
+  env: string
+  source: Layer
+  source_version: number
+  through?: RefHop[]
+}
+
+export interface ResolvedField extends FieldSource {
+  value_refs?: RefSegment[]
+  key_refs?: RefSegment[]
+}
+
 export interface EffectiveEntry {
   key: string
   format: Format
@@ -99,6 +122,7 @@ export interface EffectiveEntry {
   source: Layer
   source_version: number
   fields: FieldSource[]
+  resolved_fields?: ResolvedField[]
   version: number
 }
 
@@ -150,6 +174,22 @@ export const session = {
   set operator(v: string) {
     localStorage.setItem(OPERATOR_KEY, v)
   },
+}
+
+export interface RefNodeView {
+  item_id: string
+  namespace_id: string
+  group_id: string
+  key: string
+  layer: Layer
+  format: Format
+  env: string
+}
+
+export interface ImpactView {
+  node: string
+  direct: RefNodeView[]
+  transitive: RefNodeView[]
 }
 
 export class ApiError extends Error {
@@ -222,6 +262,14 @@ export const api = {
       'GET',
       `/items/${id}/diff?env=${encodeURIComponent(env)}&from=${from}&to=${to}`,
     ),
+
+  itemRefs: (id: string, env?: string) =>
+    request<{ references: RefNodeView[] }>(
+      'GET',
+      `/items/${id}/refs${env ? `?env=${encodeURIComponent(env)}` : ''}`,
+    ),
+  impact: (id: string, env: string) =>
+    request<ImpactView>('GET', `/items/${id}/impact?env=${encodeURIComponent(env)}`),
 
   listReleases: (ns: string) =>
     request<{ releases: Release[] }>('GET', `/releases?namespace=${encodeURIComponent(ns)}`),

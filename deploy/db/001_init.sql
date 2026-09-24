@@ -94,3 +94,34 @@ CREATE TABLE IF NOT EXISTS releases (
 );
 
 CREATE INDEX IF NOT EXISTS idx_releases_ns ON releases(tenant_id, namespace_id, started_at DESC);
+
+-- ---- reference resolution (002 references) ----
+
+-- Tenant-wide monotonic clock; the served revision of an effective key is the
+-- max revision over the key and every key it references.
+CREATE TABLE IF NOT EXISTS tenant_revisions (
+    tenant_id TEXT PRIMARY KEY REFERENCES tenants(id) ON DELETE CASCADE,
+    revision  BIGINT NOT NULL DEFAULT 0
+);
+
+-- Persisted placeholder graph. One row per placeholder of one item+env.
+CREATE TABLE IF NOT EXISTS item_refs (
+    id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    tenant_id    TEXT NOT NULL,
+    item_id      TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    env          TEXT NOT NULL,
+    seq          INTEGER NOT NULL,
+    raw          TEXT NOT NULL,
+    namespace_id TEXT NOT NULL DEFAULT '',
+    group_id     TEXT NOT NULL DEFAULT '',
+    key          TEXT NOT NULL,
+    ref_env      TEXT NOT NULL DEFAULT '',
+    UNIQUE (item_id, env, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_item_refs_src ON item_refs(tenant_id, item_id, env);
+CREATE INDEX IF NOT EXISTS idx_item_refs_target
+    ON item_refs(tenant_id, namespace_id, group_id, key);
+
+ALTER TABLE item_values ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE versions    ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 0;

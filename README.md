@@ -58,7 +58,9 @@ backend/
     merge/               ② 三级合并内核：JSON/YAML 深度合并、Properties/TOML 键级覆盖、逐叶来源
     version/             ③ 版本间行级 diff（LCS，折叠出 change）
     gray/                ④ 灰度选择：IP 名单 + FNV 确定性百分比（可测、稳定）
-    push/                ⑤ 长轮询挂起 / WebSocket 推送：Hub、事件总线（内存/Redis）、下发计数
+    ref/                 ⑤ 占位符词法/语法 + 结构化掩码（引号感知哨兵）
+    graph/               ⑥ 依赖图算法：迭代 DFS 环检测、反向传递闭包
+    push/                ⑦ 长轮询挂起 / WebSocket 推送：Hub、事件总线（内存/Redis）、下发计数
     store/               持久化契约 + 内存实现（测试/参照）+ PostgreSQL 16 实现
     service/             业务编排：配额、校验、版本提交/回退、灰度生命周期、生效值与下发门禁
     api/                 Gin 路由与处理器、长轮询、WebSocket 升级
@@ -135,7 +137,47 @@ docker-compose.yml       四服务一键编排
 - **灰度回退**：把旧值作为新版本（`gray_rollback`）写回，且只唤醒真正收到过灰度值
   的实例把它们拉回来；未入灰度的实例自始至终没离开旧值。
 
-### 3.6 多租户与配额
+### 3.7 跨配置引用（占位符解引用）
+
+一个键的值里可以写占位符，显式引用同租户下另一个键的**最终生效值**。占位符在
+三级合并之后解引用，因此引用看到的永远是对方「合并 + 解引用完」的结果，引用可以链式传递。
+
+**语法**（与普通文本严格区分，普通花括号、`$`、`@`、邮箱都不会被误判）：
+
+| 写法 | 含义 |
+| ---- | ---- |
+| `@{key}` | 裸键名：按当前解析语境（公共层→命名空间层→分组层，强层优先）找该键 |
+| `@{ns/group/key}` | 全限定：跨命名空间/分组定位一个键 |
+| `@{key?env=prod}` | 指定读取对方在另一个环境的值 |
+| `@@{` | 转义：写一个字面意义的 `@{` 定界符 |
+
+占位符可嵌在字符串中间、一个字符串里可有多个、也可整段就是一个引用。JSON/YAML/TOML
+里未加引号的整段占位符（结构位置）会代入对方的值或对象；引号内或 Properties 值里的
+占位符按文本/标量代入，解引用后仍是各自格式的合法文档（解析前由 `ref.Mask` 做引号感知的
+哨兵掩码，使 `{"timeout": @{base}}` 这类文本也能通过提交期校验）。
+
+- **来源不断链**：`GET /api/effective` 每个叶子字段除原有 `source/source_version` 外，
+  带 `resolved_fields[].value_refs`，标出每个被填入片段最终取自哪个键、那一层及版本，
+  `through` 给出 A→B→C 的完整引用链。
+- **解引用在灰度选版之后**：先决定这个实例该看到每层的哪个版本（命中灰度看新版、
+  未命中看旧版），再在该版本结果上解引用。被引用键灰度时，未命中实例连同其依赖链上的
+  键一起看到旧的解引用值。
+- **生效版本随引用推进**：每个租户有一条单调版本时钟（revision），一个键的生效版本是
+  它自身与整条引用闭包上 revision 的最大值。改了被引用键，所有（直接/间接）依赖它的键
+  生效版本随之前进，长轮询与 WebSocket 照常被唤醒（按反向传递闭包扇出事件；灰度事件对
+  整条链带同一 release id，由 Gate 用同一套实例判定把关）。
+
+**依赖图与写入门禁**：平台长期维护 `item_refs` 谁引用谁（可正查「引了谁」、反查
+「被谁依赖」）。提交新值时：占位符指向不存在目标 → 422 `ref_missing_target`；会成环
+（含自引用）→ 422 `ref_cycle` 并按顺序给出完整闭环；目标键在该环境无值 → 读取时
+422/错误 `ref_no_value`，绝不把占位符原样留在结果里。引用只在同一租户内成立，跨租户
+坐标解析不到目标，在提交时即被拒。
+
+改动前的爆炸半径：`GET /api/items/:id/impact?env=` 返回 `direct`（直接依赖）与
+`transitive`（沿反向边的传递闭包，不含自身）。控制台每个键有「引用关系」页签展示
+引用去向、被谁依赖与影响范围预览。
+
+### 3.8 多租户与配额
 
 所有数据查询都带 `tenant_id` 条件；每个租户有独立配额：
 `max_namespaces`、`max_items_per_group`、`version_retention`，超限写入返回
@@ -169,6 +211,8 @@ POST     /api/releases/:id/promote     确认无误，全量推送
 POST     /api/releases/:id/rollback-gray 发现问题，灰度回退
 
 GET      /api/effective?namespace=&group=&env=   计算合并生效值（可带 instance_id/ip）
+GET      /api/items/:id/refs?env=  查询一个键引用了谁（依赖图正向）
+GET      /api/items/:id/impact?env= 改动前影响范围预览（反向传递闭包）
 GET      /api/poll?...                  长轮询订阅
 GET      /api/ws?...                    WebSocket 订阅
 GET      /api/stats                     各命名空间连接数与最近推送看板
@@ -224,6 +268,19 @@ go test ./... -count=1
 | 全量推送后所有实例拿到新值 | `gray_test.go` |
 | 灰度回退只唤醒收到过灰度的实例 | `gray_test.go` |
 | 多租户数据互不可见 | `service_test.go::TestTenantIsolation` |
+| 跨租户引用被拒、跨环境 `?env=` 引用 | `refs_live_test.go` |
+| 占位符词法：裸键/全限定/多占位/转义/普通文本不误伤/非法报错 | `internal/ref/ref_test.go` |
+| 结构化掩码（JSON/YAML/TOML 引号内外、三引号） | `internal/ref/mask_test.go` |
+| 环检测（A→B→C→A、自引用、深链迭代 DFS、闭环顺序） | `internal/graph/graph_test.go` |
+| 反向传递闭包（含环安全、去重） | `graph_test.go` |
+| 解引用为生效值、链式 A→B→C、来源标注不断链 | `refs_test.go` |
+| 四种格式引用后仍合法、整段标量保类型 | `refs_test.go` |
+| 提交守门：目标不存在 / 成环 / 自引用拒绝且不落库 | `refs_test.go`、`api/refs_api_test.go` |
+| 读取时环检测不崩不挂、目标无值显式报错 | `refs_live_test.go`、`refs_test.go` |
+| 传递闭包影响范围、正/反向图查询 | `refs_test.go`、`refs_live_test.go` |
+| 改被引用键：依赖键版本推进、长轮询被唤醒 | `refs_live_test.go` |
+| 灰度×引用：命中/未命中实例看到新/旧解引用值、推送按链过滤 | `refs_live_test.go` |
+| 无引用老配置渲染与来源零变化 | `internal/merge/refs_compat_test.go` |
 | 命名空间/配置项配额、版本保留数 | `service_test.go` |
 | 长轮询：有更新立即返回 / 挂起 / 30s 超时提示重连 | `internal/api/api_test.go` |
 | WebSocket：首帧快照 + 变更主动推送 | `api_test.go` |
@@ -251,3 +308,14 @@ npm run build      # tsc 类型检查 + vite 生产构建
 - **下发计数在单机用内存集合、多机用 Redis SET（SADD/SCARD）**，只对真正推送成功的
   实例去重计数。
 - **公共层变更扇出**：`_public` 的一次改动会向该租户每个业务命名空间各发一条事件。
+- **引用解析纯函数化、解引用发生在灰度选版之后**：占位符词法（`ref`）与图算法（`graph`）
+  不碰数据库与网络，可独立充分单测；service 的 `resolver` 先按实例算出每层该看的版本
+  （含灰度旧值），再在合并结果上迭代式 DFS 解引用（显式栈，遇环即停并报完整链路，
+  不会无限展开也不会栈溢出）。提交期用 `latestOnly` 解析器在「代入后」做语法/Schema
+  校验，使含占位符的结构化文本也能被正确验证。
+- **版本时钟与引用扇出**：租户级单调 revision 让「生效版本」覆盖整条引用闭包；提交、
+  全量、灰度回退都沿反向传递闭包为受牵连的键补发事件，灰度事件整链共用同一 release id，
+  由 Gate 用同一套确定性实例选择把关，灰度与引用互不穿帮。
+- **结构化占位符靠掩码过解析关**：JSON/YAML/TOML 解码前，`ref.Mask` 用引号感知状态机把
+  引号外整段占位符换成 PUA 哨兵字符串，引号内保持原文；老配置不含 `@` 时整体跳过，
+  零开销、字节不变。

@@ -276,7 +276,7 @@ func (p *Postgres) GetItemByKey(ctx context.Context, tenantID, namespaceID, grou
 
 func (p *Postgres) fillValues(ctx context.Context, item *domain.Item) error {
 	rows, err := p.db.QueryContext(ctx,
-		`SELECT env, version, value, updated_by, updated_at FROM item_values WHERE item_id=$1`, item.ID)
+		`SELECT env, version, revision, value, updated_by, updated_at FROM item_values WHERE item_id=$1`, item.ID)
 	if err != nil {
 		return err
 	}
@@ -284,7 +284,7 @@ func (p *Postgres) fillValues(ctx context.Context, item *domain.Item) error {
 	for rows.Next() {
 		var env string
 		ev := &domain.EnvValue{}
-		if err := rows.Scan(&env, &ev.Version, &ev.Value, &ev.UpdatedBy, &ev.UpdatedAt); err != nil {
+		if err := rows.Scan(&env, &ev.Version, &ev.Revision, &ev.Value, &ev.UpdatedBy, &ev.UpdatedAt); err != nil {
 			return err
 		}
 		item.Values[env] = ev
@@ -375,14 +375,14 @@ func (p *Postgres) CommitValue(ctx context.Context, in CommitValueParams) (*doma
 	newVersion := current + 1
 	if current == 0 {
 		_, err = tx.ExecContext(ctx,
-			`INSERT INTO item_values (item_id, tenant_id, env, version, value, updated_by, updated_at)
-			 VALUES ($1,$2,$3,$4,$5,$6, now())`,
-			in.ItemID, in.TenantID, in.Env, newVersion, in.Value, in.Operator)
+			`INSERT INTO item_values (item_id, tenant_id, env, version, revision, value, updated_by, updated_at)
+			 VALUES ($1,$2,$3,$4,$5,$6,$7, now())`,
+			in.ItemID, in.TenantID, in.Env, newVersion, in.Revision, in.Value, in.Operator)
 	} else {
 		_, err = tx.ExecContext(ctx,
-			`UPDATE item_values SET version=$4, value=$5, updated_by=$6, updated_at=now()
+			`UPDATE item_values SET version=$4, revision=$5, value=$6, updated_by=$7, updated_at=now()
 			 WHERE item_id=$1 AND env=$2 AND version=$3`,
-			in.ItemID, in.Env, current, newVersion, in.Value, in.Operator)
+			in.ItemID, in.Env, current, newVersion, in.Revision, in.Value, in.Operator)
 	}
 	if err != nil {
 		return nil, err
@@ -393,6 +393,7 @@ func (p *Postgres) CommitValue(ctx context.Context, in CommitValueParams) (*doma
 		TenantID:   in.TenantID,
 		Env:        in.Env,
 		Version:    newVersion,
+		Revision:   in.Revision,
 		Value:      in.Value,
 		Operator:   in.Operator,
 		ChangeType: in.ChangeType,
@@ -400,9 +401,10 @@ func (p *Postgres) CommitValue(ctx context.Context, in CommitValueParams) (*doma
 		CreatedAt:  time.Now(),
 	}
 	if err := tx.QueryRowContext(ctx,
-		`INSERT INTO versions (item_id, tenant_id, env, version, value, operator, change_type, note, created_at)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
-		v.ItemID, v.TenantID, v.Env, v.Version, v.Value, v.Operator, v.ChangeType, v.Note, v.CreatedAt).
+		`INSERT INTO versions (item_id, tenant_id, env, version, revision, value, operator, change_type, note, created_at)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
+		v.ItemID, v.TenantID, v.Env, v.Version, v.Revision, v.Value, v.Operator,
+		v.ChangeType, v.Note, v.CreatedAt).
 		Scan(&v.ID); err != nil {
 		return nil, err
 	}
@@ -424,7 +426,7 @@ func (p *Postgres) CommitValue(ctx context.Context, in CommitValueParams) (*doma
 }
 
 func (p *Postgres) ListVersions(ctx context.Context, tenantID, itemID, env string, limit int) ([]*domain.Version, error) {
-	q := `SELECT id, item_id, tenant_id, env, version, value, operator, change_type, note, created_at
+	q := `SELECT id, item_id, tenant_id, env, version, revision, value, operator, change_type, note, created_at
 	      FROM versions WHERE tenant_id=$1 AND item_id=$2 AND env=$3 ORDER BY version DESC`
 	args := []any{tenantID, itemID, env}
 	if limit > 0 {
@@ -440,7 +442,7 @@ func (p *Postgres) ListVersions(ctx context.Context, tenantID, itemID, env strin
 	for rows.Next() {
 		v := &domain.Version{}
 		if err := rows.Scan(&v.ID, &v.ItemID, &v.TenantID, &v.Env, &v.Version,
-			&v.Value, &v.Operator, &v.ChangeType, &v.Note, &v.CreatedAt); err != nil {
+			&v.Revision, &v.Value, &v.Operator, &v.ChangeType, &v.Note, &v.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, v)
@@ -451,11 +453,11 @@ func (p *Postgres) ListVersions(ctx context.Context, tenantID, itemID, env strin
 func (p *Postgres) GetVersion(ctx context.Context, tenantID, itemID, env string, ver int64) (*domain.Version, error) {
 	v := &domain.Version{}
 	err := p.db.QueryRowContext(ctx,
-		`SELECT id, item_id, tenant_id, env, version, value, operator, change_type, note, created_at
+		`SELECT id, item_id, tenant_id, env, version, revision, value, operator, change_type, note, created_at
 		 FROM versions WHERE tenant_id=$1 AND item_id=$2 AND env=$3 AND version=$4`,
 		tenantID, itemID, env, ver).
 		Scan(&v.ID, &v.ItemID, &v.TenantID, &v.Env, &v.Version,
-			&v.Value, &v.Operator, &v.ChangeType, &v.Note, &v.CreatedAt)
+			&v.Revision, &v.Value, &v.Operator, &v.ChangeType, &v.Note, &v.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -584,4 +586,84 @@ func (p *Postgres) ActiveReleases(ctx context.Context, tenantID, namespaceID str
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// ---- tenant revision clock ----
+
+func (p *Postgres) NextTenantRevision(ctx context.Context, tenantID string) (int64, error) {
+	// Upsert the counter and return the new value in one statement.
+	var rev int64
+	err := p.db.QueryRowContext(ctx,
+		`INSERT INTO tenant_revisions (tenant_id, revision) VALUES ($1, 1)
+		 ON CONFLICT (tenant_id) DO UPDATE SET revision = tenant_revisions.revision + 1
+		 RETURNING revision`, tenantID).Scan(&rev)
+	return rev, err
+}
+
+// ---- reference graph ----
+
+func (p *Postgres) SetItemRefs(ctx context.Context, tenantID, itemID, env string, edges []domain.RefEdge) error {
+	tx, err := p.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM item_refs WHERE tenant_id=$1 AND item_id=$2 AND env=$3`,
+		tenantID, itemID, env); err != nil {
+		return err
+	}
+	for _, e := range edges {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO item_refs (tenant_id, item_id, env, seq, raw, namespace_id, group_id, key, ref_env)
+			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+			tenantID, itemID, env, e.Seq, e.Raw,
+			e.Target.NamespaceID, e.Target.GroupID, e.Target.Key, e.Target.Env); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func scanRefEdges(rows *sql.Rows) ([]domain.RefEdge, error) {
+	var out []domain.RefEdge
+	for rows.Next() {
+		var e domain.RefEdge
+		if err := rows.Scan(&e.TenantID, &e.ItemID, &e.Env, &e.Seq, &e.Raw,
+			&e.Target.NamespaceID, &e.Target.GroupID, &e.Target.Key, &e.Target.Env); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+func (p *Postgres) ItemRefs(ctx context.Context, tenantID, itemID, env string) ([]domain.RefEdge, error) {
+	rows, err := p.db.QueryContext(ctx,
+		`SELECT tenant_id, item_id, env, seq, raw, namespace_id, group_id, key, ref_env
+		 FROM item_refs WHERE tenant_id=$1 AND item_id=$2 AND env=$3 ORDER BY seq`,
+		tenantID, itemID, env)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanRefEdges(rows)
+}
+
+func (p *Postgres) AllItemRefs(ctx context.Context, tenantID, env string) ([]domain.RefEdge, error) {
+	q := `SELECT tenant_id, item_id, env, seq, raw, namespace_id, group_id, key, ref_env
+	      FROM item_refs WHERE tenant_id=$1`
+	args := []any{tenantID}
+	if env != "" {
+		q += " AND env=$2 ORDER BY item_id, seq"
+		args = append(args, env)
+	} else {
+		q += " ORDER BY item_id, env, seq"
+	}
+	rows, err := p.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanRefEdges(rows)
 }

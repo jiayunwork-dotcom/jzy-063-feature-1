@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"configcenter/internal/domain"
+	"configcenter/internal/graph"
 	"configcenter/internal/push"
 	"configcenter/internal/store"
 	"configcenter/internal/validator"
@@ -307,15 +308,20 @@ type CommitResult struct {
 }
 
 // Commit validates, writes a new immutable version, optionally opens a gray
-// release, and broadcasts the change.
+// release, and broadcasts the change. Write-time reference guards run before
+// anything is persisted: a placeholder pointing at a missing target or a
+// value that would close a reference cycle is rejected here.
 func (s *Service) Commit(ctx context.Context, p CommitParams) (*CommitResult, error) {
 	item, err := s.store.GetItem(ctx, p.TenantID, p.ItemID)
 	if err != nil {
 		return nil, err
 	}
 	// 1) syntax + schema validation — invalid content never reaches the DB.
-	if out := validator.Validate(item.Format, p.Value, item.Schema); !out.Valid {
-		return nil, &ValidationFailure{Errors: out.Errors}
+	// Values containing placeholders are validated after expansion in step 3.
+	if !valueHasPlaceholder(p.Value) {
+		if out := validator.Validate(item.Format, p.Value, item.Schema); !out.Valid {
+			return nil, &ValidationFailure{Errors: out.Errors}
+		}
 	}
 	// 2) gray strategy sanity.
 	if p.Gray != nil {
@@ -332,6 +338,17 @@ func (s *Service) Commit(ctx context.Context, p CommitParams) (*CommitResult, er
 			return nil, fmt.Errorf("unknown gray strategy %q", p.Gray.Strategy)
 		}
 	}
+	// 3) reference guards: parse placeholders, verify targets, detect cycles,
+	// then validate the document after dereference expansion.
+	edges, affected, err := s.validateCommitRefs(ctx, item, p.Env, p.Value)
+	if err != nil {
+		return nil, err
+	}
+	if valueHasPlaceholder(p.Value) {
+		if err := s.validateResolvedShape(ctx, item, p.Env, p.Value); err != nil {
+			return nil, err
+		}
+	}
 	t, err := s.store.GetTenant(ctx, p.TenantID)
 	if err != nil {
 		return nil, err
@@ -340,18 +357,25 @@ func (s *Service) Commit(ctx context.Context, p CommitParams) (*CommitResult, er
 	if p.ExpectedVersion == 0 {
 		changeType = "create"
 	}
+	rev, err := s.store.NextTenantRevision(ctx, p.TenantID)
+	if err != nil {
+		return nil, err
+	}
 	v, err := s.store.CommitValue(ctx, store.CommitValueParams{
 		TenantID: p.TenantID, ItemID: p.ItemID, Env: p.Env, Value: p.Value,
-		Operator: p.Operator, ChangeType: changeType, ExpectedVersion: p.ExpectedVersion,
-		Retention: t.VersionRetention,
+		Revision: rev, Operator: p.Operator, ChangeType: changeType,
+		ExpectedVersion: p.ExpectedVersion, Retention: t.VersionRetention,
 	})
 	if err != nil {
+		return nil, err
+	}
+	if err := s.store.SetItemRefs(ctx, p.TenantID, p.ItemID, p.Env, edges); err != nil {
 		return nil, err
 	}
 
 	res := &CommitResult{Version: v}
 
-	// 3) broadcast, optionally scoped by a gray release.
+	// 4) broadcast, optionally scoped by a gray release.
 	if p.Gray != nil {
 		r := &domain.Release{
 			ID: uuid.NewString(), TenantID: p.TenantID, NamespaceID: item.NamespaceID,
@@ -364,19 +388,52 @@ func (s *Service) Commit(ctx context.Context, p CommitParams) (*CommitResult, er
 			return nil, err
 		}
 		res.Release = r
-		s.fanout(ctx, domain.PushEvent{
-			Type: domain.EventChange, TenantID: p.TenantID, NamespaceID: item.NamespaceID,
-			GroupID: item.GroupID, ItemID: item.ID, Key: item.Key, Env: p.Env,
-			Version: v.Version, ReleaseID: r.ID,
-		})
+		s.fanoutChange(ctx, p.TenantID, item, p.Env, v.Version, domain.EventChange, r.ID, affected)
 	} else {
-		s.fanout(ctx, domain.PushEvent{
-			Type: domain.EventChange, TenantID: p.TenantID, NamespaceID: item.NamespaceID,
-			GroupID: item.GroupID, ItemID: item.ID, Key: item.Key, Env: p.Env,
-			Version: v.Version,
-		})
+		s.fanoutChange(ctx, p.TenantID, item, p.Env, v.Version, domain.EventChange, "", affected)
 	}
 	return res, nil
+}
+
+// fanoutChange publishes the change event for the modified item and one event
+// per transitive dependent key, so subscribers of any key whose effective
+// value changed through reference resolution are woken. For a gray change
+// every event carries the same release id: the gate then applies the very
+// same deterministic instance selection to the whole dependency chain, so a
+// non-selected instance never sees a partially-dereferenced new value.
+func (s *Service) fanoutChange(ctx context.Context, tenantID string, item *domain.Item, env string,
+	version int64, kind domain.PushEventKind, releaseID string, affectedNodeIDs []string) {
+
+	s.fanout(ctx, domain.PushEvent{
+		Type: kind, TenantID: tenantID, NamespaceID: item.NamespaceID,
+		GroupID: item.GroupID, ItemID: item.ID, Key: item.Key, Env: env,
+		Version: version, ReleaseID: releaseID,
+	})
+	for _, n := range affectedNodeIDs {
+		id, e := splitNode(n)
+		dep, err := s.store.GetItem(ctx, tenantID, id)
+		if err != nil {
+			continue
+		}
+		depVer := int64(0)
+		if ev, ok := dep.Values[e]; ok {
+			depVer = ev.Version
+		}
+		s.fanout(ctx, domain.PushEvent{
+			Type: kind, TenantID: tenantID, NamespaceID: dep.NamespaceID,
+			GroupID: dep.GroupID, ItemID: dep.ID, Key: dep.Key, Env: e,
+			Version: depVer, ReleaseID: releaseID,
+		})
+	}
+}
+
+// affectedNodes returns the post-commit transitive dependents of an item+env.
+func (s *Service) affectedNodes(ctx context.Context, tenantID, itemID, env string) []string {
+	gv, err := s.loadGraph(ctx, tenantID)
+	if err != nil {
+		return nil
+	}
+	return graph.ReverseClosure(gv.adj, nodeID(itemID, env))
 }
 
 // fanout delivers an event to a business namespace and, for changes to the
@@ -427,6 +484,18 @@ func (s *Service) Rollback(ctx context.Context, tenantID, itemID, env string, ta
 	if err != nil {
 		return nil, err
 	}
+	// Restored content must itself pass syntax and reference guards.
+	if valueHasPlaceholder(old.Value) {
+		if err := s.validateResolvedShape(ctx, item, env, old.Value); err != nil {
+			return nil, err
+		}
+	} else if out := validator.Validate(item.Format, old.Value, item.Schema); !out.Valid {
+		return nil, &ValidationFailure{Errors: out.Errors}
+	}
+	edges, affected, err := s.validateCommitRefs(ctx, item, env, old.Value)
+	if err != nil {
+		return nil, err
+	}
 	current := int64(0)
 	if ev, ok := item.Values[env]; ok {
 		current = ev.Version
@@ -435,19 +504,23 @@ func (s *Service) Rollback(ctx context.Context, tenantID, itemID, env string, ta
 	if err != nil {
 		return nil, err
 	}
+	rev, err := s.store.NextTenantRevision(ctx, tenantID)
+	if err != nil {
+		return nil, err
+	}
 	v, err := s.store.CommitValue(ctx, store.CommitValueParams{
 		TenantID: tenantID, ItemID: itemID, Env: env, Value: old.Value,
-		Operator: operator, ChangeType: "rollback",
+		Revision: rev, Operator: operator, ChangeType: "rollback",
 		Note:            fmt.Sprintf("回退到版本 %d", target),
 		ExpectedVersion: current, Retention: t.VersionRetention,
 	})
 	if err != nil {
 		return nil, err
 	}
-	s.fanout(ctx, domain.PushEvent{
-		Type: domain.EventChange, TenantID: tenantID, NamespaceID: item.NamespaceID,
-		GroupID: item.GroupID, ItemID: itemID, Key: item.Key, Env: env, Version: v.Version,
-	})
+	if err := s.store.SetItemRefs(ctx, tenantID, itemID, env, edges); err != nil {
+		return nil, err
+	}
+	s.fanoutChange(ctx, tenantID, item, env, v.Version, domain.EventChange, "", affected)
 	return &CommitResult{Version: v}, nil
 }
 
@@ -481,11 +554,12 @@ func (s *Service) Promote(ctx context.Context, tenantID, releaseID, operator str
 	if err := s.store.UpdateRelease(ctx, r); err != nil {
 		return nil, err
 	}
-	s.fanout(ctx, domain.PushEvent{
-		Type: domain.EventPromote, TenantID: tenantID, NamespaceID: r.NamespaceID,
-		GroupID: r.GroupID, ItemID: r.ItemID, Env: r.Env, Version: r.Version,
-		ReleaseID: r.ID,
-	})
+	item, err := s.store.GetItem(ctx, tenantID, r.ItemID)
+	if err != nil {
+		return nil, err
+	}
+	s.fanoutChange(ctx, tenantID, item, r.Env, r.Version, domain.EventPromote, r.ID,
+		s.affectedNodes(ctx, tenantID, r.ItemID, r.Env))
 	return r, nil
 }
 
@@ -508,17 +582,33 @@ func (s *Service) GrayRollback(ctx context.Context, tenantID, releaseID, operato
 	if err != nil {
 		return nil, nil, err
 	}
+	edges, affected, err := s.validateCommitRefs(ctx, item, r.Env, prev.Value)
+	if err != nil {
+		return nil, nil, err
+	}
+	if valueHasPlaceholder(prev.Value) {
+		if err := s.validateResolvedShape(ctx, item, r.Env, prev.Value); err != nil {
+			return nil, nil, err
+		}
+	}
 	t, err := s.store.GetTenant(ctx, tenantID)
+	if err != nil {
+		return nil, nil, err
+	}
+	rev, err := s.store.NextTenantRevision(ctx, tenantID)
 	if err != nil {
 		return nil, nil, err
 	}
 	v, err := s.store.CommitValue(ctx, store.CommitValueParams{
 		TenantID: tenantID, ItemID: r.ItemID, Env: r.Env, Value: prev.Value,
-		Operator: operator, ChangeType: "gray_rollback",
+		Revision: rev, Operator: operator, ChangeType: "gray_rollback",
 		Note:            fmt.Sprintf("灰度 %s 观察失败，撤回版本 %d", releaseID, r.Version),
 		ExpectedVersion: r.Version, Retention: t.VersionRetention,
 	})
 	if err != nil {
+		return nil, nil, err
+	}
+	if err := s.store.SetItemRefs(ctx, tenantID, r.ItemID, r.Env, edges); err != nil {
 		return nil, nil, err
 	}
 	now := time.Now()
@@ -527,11 +617,6 @@ func (s *Service) GrayRollback(ctx context.Context, tenantID, releaseID, operato
 	if err := s.store.UpdateRelease(ctx, r); err != nil {
 		return nil, nil, err
 	}
-	_ = item
-	s.fanout(ctx, domain.PushEvent{
-		Type: domain.EventRollback, TenantID: tenantID, NamespaceID: r.NamespaceID,
-		GroupID: r.GroupID, ItemID: r.ItemID, Env: r.Env, Version: v.Version,
-		ReleaseID: r.ID,
-	})
+	s.fanoutChange(ctx, tenantID, item, r.Env, v.Version, domain.EventRollback, r.ID, affected)
 	return r, v, nil
 }

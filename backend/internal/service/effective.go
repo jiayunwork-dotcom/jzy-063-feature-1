@@ -6,7 +6,6 @@ import (
 
 	"configcenter/internal/domain"
 	"configcenter/internal/gray"
-	"configcenter/internal/merge"
 	"configcenter/internal/push"
 )
 
@@ -25,7 +24,11 @@ type EffectiveEntry struct {
 	Source        domain.Layer  `json:"source"`
 	SourceVersion int64         `json:"source_version"`
 	Fields        []FieldSource `json:"fields"`
-	Version       int64         `json:"version"` // served version of the winning layer
+	// ResolvedFields carries per-leaf reference provenance (which referenced
+	// key filled each fragment and through which chain). It is nil for keys
+	// without any placeholder, keeping old payloads byte-for-byte compatible.
+	ResolvedFields []ResolvedField `json:"resolved_fields,omitempty"`
+	Version        int64           `json:"version"` // tenant revision of the key's reference closure
 }
 
 // GroupSnapshot is the effective configuration of one group.
@@ -60,73 +63,41 @@ func (ic InstanceContext) grayInstance() gray.Instance {
 	return gray.Instance{ID: id, IP: ic.IP}
 }
 
-// layerContainers lists the three stores that contribute to a business group,
-// weakest first.
-func layerContainers(nsID, groupID string) []struct {
-	ns, grp string
-	layer   domain.Layer
-} {
-	return []struct {
-		ns, grp string
-		layer   domain.Layer
-	}{
-		{domain.PublicNamespaceID, domain.PublicNamespaceID, domain.LayerPublic},
-		{nsID, domain.DefaultGroupID, domain.LayerNamespace},
-		{nsID, groupID, domain.LayerGroup},
-	}
-}
-
-// releaseByItem collects every active gray release touching this snapshot,
-// from both the business namespace and the public namespace.
-func (s *Service) releaseByItem(ctx context.Context, tenantID, nsID string) (map[string]*domain.Release, error) {
-	out := map[string]*domain.Release{}
-	for _, scope := range []string{nsID, domain.PublicNamespaceID} {
-		rs, err := s.store.ActiveReleases(ctx, tenantID, scope)
-		if err != nil {
-			return nil, err
-		}
-		for _, r := range rs {
-			out[r.ItemID] = r
-		}
-	}
-	return out, nil
-}
-
-// servedValue resolves the value/version an instance is entitled to for one
-// item, honoring an ongoing gray release.
+// servedValue resolves the value/version/revision an instance is entitled to
+// for one item, honoring an ongoing gray release. The revision comes from the
+// actual served version (current for selected instances, the historical
+// version for instances a gray release hides it from), so downstream
+// reference resolution advances the snapshot clock correctly for everyone.
 func (s *Service) servedValue(ctx context.Context, item *domain.Item, env string,
-	releases map[string]*domain.Release, ic InstanceContext) (string, int64, error) {
+	releases map[string]*domain.Release, ic InstanceContext) (string, int64, int64, error) {
 
 	ev, exists := item.Values[env]
 	if !exists {
-		return "", 0, nil
+		return "", 0, 0, nil
 	}
 	r, grayed := releases[item.ID]
 	if !grayed {
-		return ev.Value, ev.Version, nil
+		return ev.Value, ev.Version, ev.Revision, nil
 	}
 	if gray.ShouldDeliver(r.Strategy, r.Percent, r.IPs, r.ID, ic.grayInstance()) {
 		// selected: sees the gray value (which equals the current value)
-		return ev.Value, ev.Version, nil
+		return ev.Value, ev.Version, ev.Revision, nil
 	}
 	// not selected: must see the value before the gray started
 	if r.PrevVersion == 0 {
-		return "", 0, nil
+		return "", 0, 0, nil
 	}
 	prev, err := s.store.GetVersion(ctx, item.TenantID, item.ID, env, r.PrevVersion)
 	if err != nil {
-		return "", 0, err
+		return "", 0, 0, err
 	}
-	return prev.Value, r.PrevVersion, nil
+	return prev.Value, r.PrevVersion, prev.Revision, nil
 }
 
 // Effective computes the merged configuration visible to an instance. When
 // groupID is empty every business group of the namespace is included.
 func (s *Service) Effective(ctx context.Context, tenantID, nsID, groupID, env string, ic InstanceContext) (*EffectiveSnapshot, error) {
-	releases, err := s.releaseByItem(ctx, tenantID, nsID)
-	if err != nil {
-		return nil, err
-	}
+	r := newResolver(s, ctx, tenantID, env, ic)
 
 	snap := &EffectiveSnapshot{
 		TenantID: tenantID, NamespaceID: nsID, GroupID: groupID, Env: env,
@@ -148,7 +119,7 @@ func (s *Service) Effective(ctx context.Context, tenantID, nsID, groupID, env st
 	}
 
 	for _, gid := range groups {
-		gs, err := s.groupSnapshot(ctx, tenantID, nsID, gid, env, releases, ic)
+		gs, err := s.groupSnapshot(r, nsID, gid)
 		if err != nil {
 			return nil, err
 		}
@@ -164,86 +135,39 @@ func (s *Service) Effective(ctx context.Context, tenantID, nsID, groupID, env st
 	return snap, nil
 }
 
-func (s *Service) groupSnapshot(ctx context.Context, tenantID, nsID, groupID, env string,
-	releases map[string]*domain.Release, ic InstanceContext) (*GroupSnapshot, error) {
-
-	// key -> layers that define it
-	type layerData struct {
-		layer   domain.Layer
-		format  domain.Format
-		value   string
-		version int64
-	}
-	byKey := map[string][]layerData{}
-	formatOf := map[string]domain.Format{}
-
-	for _, loc := range layerContainers(nsID, groupID) {
-		items, err := s.store.ListItems(ctx, tenantID, loc.ns, loc.grp)
+// groupSnapshot resolves every effective key of one business group through
+// the shared resolver. The snapshot version is the max tenant revision over
+// each key and its whole reference closure, so changing a referenced key
+// moves the served version of every dependent key without any new commit.
+func (s *Service) groupSnapshot(r *resolver, nsID, groupID string) (*GroupSnapshot, error) {
+	// Union of keys contributed by the three layer containers (as visible to
+	// this instance in this env).
+	keySet := map[string]struct{}{}
+	keys := []string{}
+	for _, loc := range servingContainers(nsID, groupID) {
+		m, err := r.containerItems(nodeCoord{ns: loc.ns, grp: loc.grp, env: r.env})
 		if err != nil {
 			return nil, err
 		}
-		for _, item := range items {
-			val, ver, err := s.servedValue(ctx, item, env, releases, ic)
-			if err != nil {
-				return nil, err
+		for k := range m {
+			if _, ok := keySet[k]; !ok {
+				keySet[k] = struct{}{}
+				keys = append(keys, k)
 			}
-			if ver == 0 {
-				continue // item has no value in this env visible to the instance
-			}
-			byKey[item.Key] = append(byKey[item.Key], layerData{
-				layer: loc.layer, format: item.Format, value: val, version: ver,
-			})
-			formatOf[item.Key] = item.Format
 		}
-	}
-
-	keys := make([]string, 0, len(byKey))
-	for k := range byKey {
-		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 
 	g := &GroupSnapshot{GroupID: groupID}
 	for _, key := range keys {
-		layers := byKey[key]
-		f := formatOf[key]
-		inputs := make([]merge.LayerInput, 0, len(layers))
-		for _, l := range layers {
-			inputs = append(inputs, merge.LayerInput{
-				Layer: l.layer, Format: l.format, Value: l.value, Version: l.version,
-			})
-		}
-		res, err := merge.Merge(f, inputs)
+		n, err := r.resolveKey(nsID, groupID, key)
 		if err != nil {
 			return nil, err
 		}
-		entry := EffectiveEntry{
-			Key: key, Format: f, Value: res.Render,
+		g.Entries = append(g.Entries, n.entry)
+		if n.rev > g.Version {
+			g.Version = n.rev
 		}
-		// strongest layer among surviving leaves = the key's overall source
-		var strongest domain.Layer
-		var strongestVer int64
-		for _, kr := range res.Keys {
-			entry.Fields = append(entry.Fields, FieldSource{
-				Path: kr.Path, Source: kr.Source, SourceVersion: kr.SourceVersion,
-			})
-			if domain.LayerPriority[kr.Source] >= domain.LayerPriority[strongest] {
-				strongest = kr.Source
-				strongestVer = kr.SourceVersion
-			}
-		}
-		// version of the winning layer contribution (used for snapshot version)
-		for _, l := range layers {
-			if l.layer == strongest && l.version > entry.Version {
-				entry.Version = l.version
-			}
-		}
-		entry.Source = strongest
-		entry.SourceVersion = strongestVer
-		if entry.Version > g.Version {
-			g.Version = entry.Version
-		}
-		g.Entries = append(g.Entries, entry)
 	}
 	return g, nil
 }

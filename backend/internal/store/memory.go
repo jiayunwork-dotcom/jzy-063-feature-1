@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,6 +23,8 @@ type Memory struct {
 	versions   map[string][]*domain.Version // key: tenant/itemID/env
 	versionSeq map[string]int64             // key: tenant/itemID/env
 	releases   map[string]*domain.Release
+	refs       map[string][]domain.RefEdge // key: tenant/itemID/env
+	revisions  map[string]int64            // tenant-wide monotonic clock
 	verDBSeq   int64
 }
 
@@ -36,6 +39,8 @@ func NewMemory() *Memory {
 		versions:   map[string][]*domain.Version{},
 		versionSeq: map[string]int64{},
 		releases:   map[string]*domain.Release{},
+		refs:       map[string][]domain.RefEdge{},
+		revisions:  map[string]int64{},
 	}
 }
 
@@ -289,6 +294,7 @@ func (m *Memory) CommitValue(_ context.Context, p CommitValueParams) (*domain.Ve
 		TenantID:   p.TenantID,
 		Env:        p.Env,
 		Version:    newVer,
+		Revision:   p.Revision,
 		Value:      p.Value,
 		Operator:   p.Operator,
 		ChangeType: p.ChangeType,
@@ -304,7 +310,8 @@ func (m *Memory) CommitValue(_ context.Context, p CommitValueParams) (*domain.Ve
 		item.Values = map[string]*domain.EnvValue{}
 	}
 	item.Values[p.Env] = &domain.EnvValue{
-		Value: p.Value, Version: newVer, UpdatedAt: v.CreatedAt, UpdatedBy: p.Operator,
+		Value: p.Value, Version: newVer, Revision: p.Revision,
+		UpdatedAt: v.CreatedAt, UpdatedBy: p.Operator,
 	}
 	item.UpdatedAt = v.CreatedAt
 	cp := *v
@@ -410,6 +417,64 @@ func (m *Memory) ActiveReleases(_ context.Context, tenantID, namespaceID string)
 }
 
 func (m *Memory) Close() error { return nil }
+
+func (m *Memory) NextTenantRevision(_ context.Context, tenantID string) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.revisions[tenantID]++
+	return m.revisions[tenantID], nil
+}
+
+func refKey(tenantID, itemID, env string) string {
+	return tenantID + "/" + itemID + "/" + env
+}
+
+func (m *Memory) SetItemRefs(_ context.Context, tenantID, itemID, env string, edges []domain.RefEdge) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if item, ok := m.items[itemID]; !ok || item.TenantID != tenantID {
+		return ErrNotFound
+	}
+	cp := make([]domain.RefEdge, len(edges))
+	copy(cp, edges)
+	m.refs[refKey(tenantID, itemID, env)] = cp
+	return nil
+}
+
+func (m *Memory) ItemRefs(_ context.Context, tenantID, itemID, env string) ([]domain.RefEdge, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := m.refs[refKey(tenantID, itemID, env)]
+	cp := make([]domain.RefEdge, len(out))
+	copy(cp, out)
+	return cp, nil
+}
+
+func (m *Memory) AllItemRefs(_ context.Context, tenantID, env string) ([]domain.RefEdge, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]domain.RefEdge, 0)
+	for k, list := range m.refs {
+		// keys are tenant/itemID/env; split off tenant and env conservatively.
+		if !strings.HasPrefix(k, tenantID+"/") {
+			continue
+		}
+		rest := k[len(tenantID)+1:]
+		slash := strings.LastIndex(rest, "/")
+		edgeEnv := rest[slash+1:]
+		if env != "" && edgeEnv != env {
+			continue
+		}
+		out = append(out, list...)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].ItemID != out[j].ItemID {
+			return out[i].ItemID < out[j].ItemID
+		}
+		return out[i].Seq < out[j].Seq
+	})
+	return out, nil
+}
 
 func cloneItem(in *domain.Item) *domain.Item {
 	cp := *in

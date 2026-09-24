@@ -71,6 +71,8 @@ func NewRouter(svc *service.Service) *gin.Engine {
 		cfg.POST("/items/:id/values", s.commitValue)
 		cfg.POST("/items/:id/rollback", s.rollback)
 		cfg.GET("/items/:id/diff", s.diff)
+		cfg.GET("/items/:id/refs", s.itemRefs)
+		cfg.GET("/items/:id/impact", s.itemImpact)
 
 		cfg.GET("/releases", s.listReleases)
 		cfg.GET("/releases/:id", s.getRelease)
@@ -130,6 +132,13 @@ func fail(c *gin.Context, err error) {
 	default:
 		if vf, ok := err.(*service.ValidationFailure); ok {
 			c.JSON(422, gin.H{"error": "validation failed", "errors": vf.Errors})
+			return
+		}
+		if re, ok := err.(*service.RefError); ok {
+			c.JSON(422, gin.H{
+				"error": re.Message, "code": re.Code,
+				"source": re.Source, "target": re.Target, "cycle": re.Cycle,
+			})
 			return
 		}
 		c.JSON(400, gin.H{"error": err.Error()})

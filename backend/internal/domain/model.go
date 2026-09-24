@@ -107,8 +107,13 @@ type Group struct {
 
 // EnvValue is the value of one item in one environment.
 type EnvValue struct {
-	Value     string    `json:"value"`
-	Version   int64     `json:"version"`
+	Value   string `json:"value"`
+	Version int64  `json:"version"`
+	// Revision is the tenant-wide monotonic clock reading at the moment this
+	// value was committed. Effective snapshots take the max revision over the
+	// value and everything it references, so a change to a referenced key
+	// advances the served revision of every dependent key.
+	Revision  int64     `json:"revision,omitempty"`
 	UpdatedAt time.Time `json:"updated_at"`
 	UpdatedBy string    `json:"updated_by"`
 }
@@ -136,6 +141,7 @@ type Version struct {
 	TenantID   string    `json:"tenant_id"`
 	Env        string    `json:"env"`
 	Version    int64     `json:"version"`
+	Revision   int64     `json:"revision,omitempty"`
 	Value      string    `json:"value"`
 	Operator   string    `json:"operator"`
 	ChangeType string    `json:"change_type"` // create | update | rollback | gray_rollback

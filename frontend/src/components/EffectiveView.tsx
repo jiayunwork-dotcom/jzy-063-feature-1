@@ -73,20 +73,47 @@ export function EffectiveView({ namespace, group, env, tick }: Props) {
                 <th>叶子字段</th>
                 <th>来源层</th>
                 <th>来源版本</th>
+                <th>引用来源</th>
               </tr>
             </thead>
             <tbody>
-              {e.fields.map((f) => (
-                <tr key={f.path}>
-                  <td>
-                    <code>{f.path}</code>
-                  </td>
-                  <td>
-                    <span className={`src-tag ${f.source}`}>{layerLabel(f.source)}</span>
-                  </td>
-                  <td>v{f.source_version}</td>
-                </tr>
-              ))}
+              {e.fields.map((f) => {
+                const rf = e.resolved_fields?.find((x) => x.path === f.path)
+                const segs = rf?.value_refs || []
+                return (
+                  <tr key={f.path}>
+                    <td>
+                      <code>{f.path}</code>
+                    </td>
+                    <td>
+                      <span className={`src-tag ${f.source}`}>{layerLabel(f.source)}</span>
+                    </td>
+                    <td>v{f.source_version}</td>
+                    <td>
+                      {segs.length === 0 ? (
+                        <span className="muted">—</span>
+                      ) : (
+                        segs.map((s, i) => (
+                          <div key={i} title={`占位符 ${s.placeholder}`}>
+                            <code>
+                              {s.namespace_id}/{s.group_id}/{s.key}[{s.env}]
+                            </code>{' '}
+                            <span className={`src-tag ${s.source}`}>
+                              {layerLabel(s.source)} v{s.source_version}
+                            </span>
+                            {s.through && s.through.length > 1 && (
+                              <span className="muted">
+                                {' '}
+                                链：{s.through.map((h) => h.key).join(' → ')}
+                              </span>
+                            )}
+                          </div>
+                        ))
+                      )}
+                    </td>
+                  </tr>
+                )
+              })}
             </tbody>
           </table>
         </div>
